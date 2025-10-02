@@ -5,8 +5,7 @@ from pathlib import Path
 
 # 리포 루트 경로를 파이썬 모듈 경로에 추가
 ROOT = Path(__file__).resolve().parents[1]  # repo root (…/your-repo/)
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from app import (
     two_weeks_range, build_cover_df, build_detail_df,
