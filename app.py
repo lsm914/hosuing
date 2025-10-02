@@ -462,3 +462,216 @@ if run:
         file_name=f"applyhome_{today_ymd()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [NEW] 엑셀(단지세부정보) → 카드 생성 탭
+# ──────────────────────────────────────────────────────────────────────────────
+import re
+
+def _num(x, default=0):
+    """숫자 파싱: '-', '', '(△52)' 같은 값 안전 처리."""
+    if pd.isna(x):
+        return default
+    s = str(x).strip()
+    m = re.search(r"-?\d+(\.\d+)?", s)
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except:
+        return default
+
+def _band_from_house_ty(s: str) -> int:
+    """주택형 앞쪽 3자리(숫자)를 band로. 예: '084.8422A' → 84, '101.9980A' → 101"""
+    if pd.isna(s):
+        return None
+    s = str(s).strip()
+    m = re.match(r"(\d{2,3})", s)
+    if m:
+        return int(m.group(1))
+    # 백업: 소수점 앞자리
+    p = s.split(".")[0]
+    m = re.search(r"(\d{2,3})", p)
+    return int(m.group(1)) if m else None
+
+def _to_pyeong(m2):
+    try:
+        return float(m2) * 0.3025
+    except:
+        return None
+
+def build_cards_from_detail_sheet(detail_df: pd.DataFrame, cover_df: pd.DataFrame|None=None):
+    """
+    detail_df: '단지세부정보' 시트 DataFrame
+    cover_df:  (선택) 'aptlist(cover)' 시트 DataFrame (있으면 입주예정월 표시)
+    return: {단지명: {'meta': {...}, 'rows': pd.DataFrame, 'subtotal': dict}}
+    """
+    df = detail_df.copy()
+
+    # 필드 정규화
+    need_cols = ["단지명","주택형","공급금액","공급면적","일반공급","특별공급",
+                 "접수건수","순위","모집공고일","공급위치","모델번호"]
+    for c in need_cols:
+        if c not in df.columns:
+            df[c] = None
+
+    df["공급금액"]  = df["공급금액"].apply(_num)
+    df["공급면적"]  = df["공급면적"].apply(_num)
+    df["일반공급"]  = df["일반공급"].apply(_num)
+    df["특별공급"]  = df["특별공급"].apply(_num)
+    df["접수건수"]  = df["접수건수"].apply(_num)
+    df["순위"]      = df["순위"].astype(str).str.strip()
+    df["band"]      = df["주택형"].apply(_band_from_house_ty)
+    df["면적(평)"]   = df["공급면적"].apply(_to_pyeong)
+    df["평단가"]     = df.apply(lambda r: (r["공급금액"]/r["면적(평)"]) if (r["면적(평)"] and r["면적(평)"]>0) else None, axis=1)
+
+    # (단지명, 주택형) 별 공급세대수(=일반+특별) 대표값, 금액/면적 대표값 추출
+    # detail 시트는 지역/순위로 행이 중복되므로, 공급/금액/면적은 한 번만 잡아야 가중평균이 올바름
+    by_type = (
+        df.groupby(["단지명","주택형","band"], dropna=False)
+          .agg(공급세대수=("일반공급", "max"))  # 일단 일반공급로 두고 아래서 +특별공급
+          .reset_index()
+    )
+    spc = df.groupby(["단지명","주택형","band"], dropna=False)["특별공급"].max().reset_index(name="특별공급")
+    price = df.groupby(["단지명","주택형","band"], dropna=False)[["공급금액","공급면적","면적(평)","평단가"]].max().reset_index()
+    by_type = by_type.merge(spc, on=["단지명","주택형","band"], how="left") \
+                     .merge(price, on=["단지명","주택형","band"], how="left")
+    by_type["세대수"] = (by_type["공급세대수"].fillna(0) + by_type["특별공급"].fillna(0)).astype(float)
+
+    # (단지명, band) 레벨 집계: 금액/평단가 = 세대수 가중평균, 세대수 = 합
+    def _wavg(series, weights):
+        w = pd.Series(weights).fillna(0).astype(float)
+        x = pd.Series(series).astype(float)
+        s = (x * w).sum()
+        tw = w.sum()
+        return (s / tw) if tw > 0 else None
+
+    band_level = (
+        by_type.groupby(["단지명","band"], dropna=False)
+               .apply(lambda g: pd.Series({
+                   "공급세대수": g["세대수"].sum(),
+                   "공급가액": _wavg(g["공급금액"], g["세대수"]),
+                   "평단가": _wavg(g["평단가"], g["세대수"]),
+               }))
+               .reset_index()
+    )
+
+    # 경쟁률: 원본 df에서 순위별 접수 합 → band로 합산
+    rank1 = (df[df["순위"]=="1"]
+             .groupby(["단지명","band"])["접수건수"].sum().reset_index(name="접수1"))
+    rank12 = (df[df["순위"].isin(["1","2"])]
+             .groupby(["단지명","band"])["접수건수"].sum().reset_index(name="접수12"))
+    band_level = band_level.merge(rank1, on=["단지명","band"], how="left") \
+                           .merge(rank12, on=["단지명","band"], how="left")
+    band_level["접수1"]  = band_level["접수1"].fillna(0)
+    band_level["접수12"] = band_level["접수12"].fillna(0)
+    band_level["경쟁률(1순위)"]   = band_level.apply(lambda r: round(r["접수1"]/r["공급세대수"], 2) if r["공급세대수"] else None, axis=1)
+    band_level["경쟁률(1,2순위)"] = band_level.apply(lambda r: round(r["접수12"]/r["공급세대수"], 2) if r["공급세대수"] else None, axis=1)
+
+    # 단지별 메타 (모집공고일: 월단위, 입주예정월은 cover 시트 있으면 조인)
+    meta = (df.groupby("단지명")
+              .agg(모집공고일=("모집공고일", "first"), 공급위치=("공급위치","first"))
+              .reset_index())
+    def _to_yyyymm(x):
+        if pd.isna(x): return ""
+        s = str(x)
+        return s[:7] if len(s)>=7 else s
+
+    meta["모집공고월"] = meta["모집공고일"].map(_to_yyyymm)
+    if cover_df is not None and "HOUSE_NM" in cover_df.columns:
+        cov = cover_df.copy()
+        if "MVN_PREARNGE_YM" in cov.columns:
+            cov["입주예정월"] = cov["MVN_PREARNGE_YM"].map(lambda v: f"{str(v)[:4]}-{str(v)[4:]}" if (pd.notna(v) and len(str(v))==6) else "")
+        else:
+            cov["입주예정월"] = ""
+        cov = cov.rename(columns={"HOUSE_NM":"단지명"})
+        meta = meta.merge(cov[["단지명","입주예정월"]].drop_duplicates("단지명"), on="단지명", how="left")
+    else:
+        meta["입주예정월"] = ""
+
+    # 단지별 결과 dict
+    out = {}
+    for site, g in band_level.groupby("단지명"):
+        g = g.sort_values("band")
+        # 표시 컬럼 구성
+        show = g[["band","공급세대수","공급가액","평단가","경쟁률(1순위)","경쟁률(1,2순위)"]].copy()
+        show = show.rename(columns={"band":"타입","공급가액":"공급가액(만원)"})
+        # 소계(세대수 가중)
+        tot_supply = g["공급세대수"].sum()
+        tot_amt    = _wavg(g["공급가액"], g["공급세대수"])
+        tot_py     = _wavg(g["평단가"], g["공급세대수"])
+        tot_r1     = (g["접수1"].sum()/tot_supply) if tot_supply else None
+        tot_r12    = (g["접수12"].sum()/tot_supply) if tot_supply else None
+        subtotal = {
+            "타입": "소계",
+            "공급세대수": int(tot_supply) if pd.notna(tot_supply) else None,
+            "공급가액(만원)": round(tot_amt) if pd.notna(tot_amt) else None,
+            "평단가": round(tot_py) if pd.notna(tot_py) else None,
+            "경쟁률(1순위)": round(tot_r1, 2) if tot_r1 is not None else None,
+            "경쟁률(1,2순위)": round(tot_r12, 2) if tot_r12 is not None else None,
+        }
+        # 포맷팅
+        def _fmt(df_):
+            df_ = df_.copy()
+            for c in ["공급세대수","공급가액(만원)"]:
+                if c in df_.columns: df_[c] = df_[c].map(lambda v: f"{int(round(v)):,}" if pd.notna(v) else "")
+            if "평단가" in df_.columns:
+                df_["평단가"] = df_["평단가"].map(lambda v: f"@{int(round(v)):,}" if pd.notna(v) else "")
+            for c in ["경쟁률(1순위)","경쟁률(1,2순위)"]:
+                if c in df_.columns: df_[c] = df_[c].map(lambda v: f"{v:.2f}" if pd.notna(v) else "")
+            return df_
+
+        out[site] = {
+            "meta": meta[meta["단지명"]==site].iloc[0].to_dict() if site in set(meta["단지명"]) else {"모집공고월":"","입주예정월":""},
+            "rows": _fmt(show),
+            "subtotal": subtotal,
+        }
+    return out
+
+def render_card(site: str, info: dict):
+    m = info["meta"]
+    rows = info["rows"]
+    sub = info["subtotal"]
+    st.markdown(
+        f"""
+        <div style="border:1px solid #666; padding:8px; margin:10px 0; border-radius:6px;">
+          <div style="display:flex; justify-content:space-between;">
+            <div style="font-weight:700;">{site}</div>
+            <div style="font-size:12px; color:#666;">(단위 : 만원)</div>
+          </div>
+          <div style="font-size:12px; margin-top:6px;">
+            <b>모집공고일:</b> {m.get('모집공고월','')} &nbsp;&nbsp;
+            <b>입주예정월:</b> {m.get('입주예정월','') or ''}
+          </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.dataframe(rows, use_container_width=True)
+    # 소계 줄
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:12px; font-size:13px; margin-top:6px;">
+          <div><b>소계</b></div>
+          <div>세대수: {sub['공급세대수']:,} </div>
+          <div>공급가액: {sub['공급가액(만원)']:,} </div>
+          <div>평단가: @{sub['평단가']:,} </div>
+          <div>경쟁률(1): {sub['경쟁률(1순위)']:.2f} </div>
+          <div>경쟁률(1,2): {sub['경쟁률(1,2순위)']:.2f}</div>
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+st.header("📥 엑셀(단지세부정보) 업로드 → 카드 생성")
+uploaded = st.file_uploader("생성된 Excel(.xlsx)을 올리세요 (3번째 시트: 단지세부정보).", type=["xlsx"])
+if uploaded:
+    x = pd.ExcelFile(uploaded)
+    detail = pd.read_excel(x, sheet_name="단지세부정보")
+    cover = pd.read_excel(x, sheet_name="aptlist(cover)") if "aptlist(cover)" in x.sheet_names else None
+    cards = build_cards_from_detail_sheet(detail, cover)
+    # 단지명 순서 고정: 번호(있다면) or 이름순
+    for site in sorted(cards.keys()):
+        render_card(site, cards[site])
+
