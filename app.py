@@ -353,116 +353,188 @@ def build_excel(by_complex: pd.DataFrame, cover: pd.DataFrame, detail: pd.DataFr
     return buf.getvalue()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Streamlit UI
+# GitHub Actions Artifact → 최신 엑셀 다운로드 & 카드 렌더
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Applyhome 주간집계", layout="wide")
-st.title("🏢 청약정보(ODCloud) 주간 수집·집계")
+import os, io, re, zipfile, requests
+import pandas as pd
+import streamlit as st
 
-if not SERVICE_KEY:
-    st.error("ODCLOUD_SERVICE_KEY 가 설정되지 않았습니다. .env 파일을 확인하세요.")
+GH_TOKEN = os.getenv("GH_TOKEN", st.secrets.get("GH_TOKEN", ""))
+GH_OWNER = os.getenv("GH_OWNER", st.secrets.get("GH_OWNER", "lsm914"))
+GH_REPO  = os.getenv("GH_REPO",  st.secrets.get("GH_REPO",  "hosuing"))
+ARTIFACT_NAME = os.getenv("ARTIFACT_NAME", st.secrets.get("ARTIFACT_NAME", "weekly-excel"))
 
-start_default, end_default = two_weeks_range()
-col1, col2, col3 = st.columns(3)
-with col1:
-    start_date = st.text_input("시작일 (YYYY-MM-DD)", value=start_default)
-with col2:
-    end_date = st.text_input("종료일 (YYYY-MM-DD)", value=end_default)
-with col3:
-    area_mode = st.selectbox("검색지역", ["전체","직접코드입력"], index=0)
+def gh_headers():
+    if not GH_TOKEN:
+        raise RuntimeError("GH_TOKEN이 설정되지 않았습니다. Streamlit secrets 또는 환경변수에 넣어주세요.")
+    return {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-if area_mode == "전체":
-    area_codes = ALL_AREA_CODES
-else:
-    codes = st.text_input("콤마로 구분된 지역코드들", value="100,200")
-    try:
-        area_codes = [int(x.strip()) for x in codes.split(",") if x.strip()]
-    except Exception:
-        st.warning("지역코드 파싱 오류. 기본 전체로 대체합니다.")
-        area_codes = ALL_AREA_CODES
+def download_latest_artifact_zip(owner: str, repo: str, artifact_name: str) -> bytes:
+    """리포의 artifacts 중 이름이 artifact_name인 것 중 최신 1개 zip 바이트 반환"""
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts?per_page=100"
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    r.raise_for_status()
+    artifacts = r.json().get("artifacts", [])
+    candidates = [a for a in artifacts if a.get("name") == artifact_name and not a.get("expired")]
+    if not candidates:
+        raise RuntimeError(f"'{artifact_name}' 이름의 artifact를 찾지 못했습니다.")
+    latest = sorted(candidates, key=lambda a: a.get("created_at",""), reverse=True)[0]
+    dl = requests.get(latest["archive_download_url"], headers=gh_headers(), timeout=60)
+    dl.raise_for_status()
+    return dl.content  # zip bytes
 
-run = st.button("데이터 수집/집계 실행")
+def extract_first_excel_from_zip(zip_bytes: bytes) -> tuple[bytes, str]:
+    """zip 안에서 .xlsx 파일을 찾아 바이트와 파일명 반환"""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        xlsx_names = [n for n in z.namelist() if n.lower().endswith(".xlsx")]
+        if not xlsx_names:
+            raise RuntimeError("zip 내부에 .xlsx 파일을 찾지 못했습니다.")
+        name = sorted(xlsx_names)[0]
+        return z.read(name), os.path.basename(name)
 
-if run:
-    with st.spinner("표준 목록(cover) 수집 중…"):
-        cover_df = build_cover_df(start_date, end_date, area_codes)
-    st.success(f"단지 목록 {len(cover_df)}건")
-    st.dataframe(cover_df.head(20))
+# --------- detail 시트를 band(주택형 앞 3자리)로 집계해 카드 데이터 생성 ----------
+def _num(x, default=0):
+    if pd.isna(x): return default
+    s = str(x).strip()
+    m = re.search(r"-?\d+(\.\d+)?", s)
+    return float(m.group(0)) if m else default
 
-    with st.spinner("세부/경쟁률 조인(detail) 구축 중…"):
-        detail_df = build_detail_df(cover_df)
-    st.success(f"세부 행 수 {len(detail_df)}건")
+def _band_from_house_ty(s: str) -> int|None:
+    if pd.isna(s): return None
+    s = str(s).strip()
+    m = re.match(r"(\d{2,3})", s)
+    if m: return int(m.group(1))
+    p = s.split(".")[0]
+    m = re.search(r"(\d{2,3})", p)
+    return int(m.group(1)) if m else None
 
-    with st.spinner("(단지×주택형) 요약(combine) 산출 중…"):
-        combine_df = build_combine_df(detail_df)
-    st.success(f"요약 행 수 {len(combine_df)}건")
+def _to_pyeong(m2):
+    try: return float(m2)*0.3025
+    except: return None
 
-    with st.spinner("단지별 가중평균/경쟁률(by_complex) 산출 중…"):
-        by_complex_df = build_by_complex_df(combine_df, detail_df, cover_df)
-    st.success(f"단지별 행 수 {len(by_complex_df)}건")
+def build_cards_from_detail_sheet(detail_df: pd.DataFrame, cover_df: pd.DataFrame|None=None):
+    df = detail_df.copy()
+    need = ["단지명","주택형","공급금액","공급면적","일반공급","특별공급","접수건수","순위","모집공고일","공급위치"]
+    for c in need:
+        if c not in df.columns: df[c] = None
 
-    st.subheader("📇 단지 카드")
-    years = ["(전체)"] + sorted(list(set(by_complex_df["입주년도"].dropna())))
-    sel_year = st.selectbox("입주년도 필터", years)
-    cards_df = by_complex_df.copy()
-    if sel_year != "(전체)":
-        cards_df = cards_df[cards_df["입주년도"]==sel_year]
+    df["공급금액"] = df["공급금액"].apply(_num)
+    df["공급면적"] = df["공급면적"].apply(_num)
+    df["일반공급"] = df["일반공급"].apply(_num)
+    df["특별공급"] = df["특별공급"].apply(_num)
+    df["접수건수"] = df["접수건수"].apply(_num)
+    df["순위"] = df["순위"].astype(str).str.strip()
+    df["band"] = df["주택형"].apply(_band_from_house_ty)
+    df["면적(평)"] = df["공급면적"].apply(_to_pyeong)
+    df["평단가"] = df.apply(lambda r: (r["공급금액"]/r["면적(평)"]) if (r["면적(평)"] and r["면적(평)"]>0) else None, axis=1)
 
-    for site, grp in cards_df.groupby("단지명"):
-        st.markdown(f"### {site}")
-        grp = grp.sort_values("주택형").head(5)
-        st.dataframe(
-            grp[["주택형","공급세대수","평균공급금액","평단가","경쟁률1","경쟁률1+2"]]
-            .rename(columns={"평균공급금액":"공급가액"})
-        )
+    # (단지명, 주택형) 대표치(세대수=일반+특별, 금액/평단가 등)
+    by_type = (df.groupby(["단지명","주택형","band"], dropna=False)
+                 .agg(일반=("일반공급","max"), 특별=("특별공급","max"),
+                      금액=("공급금액","max"), 평단=("평단가","max"))
+                 .reset_index())
+    by_type["세대수"] = by_type["일반"].fillna(0) + by_type["특별"].fillna(0)
 
-    st.subheader("🗺️ 단지 위치 지도")
-    addrs = list(set(by_complex_df["공급위치"].dropna()))
-    geo_cache = geocode_addresses(addrs)
-    geo_map = geo_cache.set_index("address")[["lat","lon"]].to_dict("index")
+    def _wavg(x, w):
+        x = pd.Series(x).astype(float); w = pd.Series(w).fillna(0).astype(float)
+        s, tw = (x*w).sum(), w.sum()
+        return (s/tw) if tw>0 else None
 
-    map_df = by_complex_df.copy()
-    map_df["lat"] = map_df["공급위치"].map(lambda a: geo_map.get(a, {}).get("lat"))
-    map_df["lon"] = map_df["공급위치"].map(lambda a: geo_map.get(a, {}).get("lon"))
-    map_df = map_df.dropna(subset=["lat","lon"])
+    band = (by_type.groupby(["단지명","band"], dropna=False)
+                  .apply(lambda g: pd.Series({
+                      "공급세대수": g["세대수"].sum(),
+                      "공급가액": _wavg(g["금액"], g["세대수"]),
+                      "평단가": _wavg(g["평단"], g["세대수"]),
+                  })).reset_index())
 
-    rep = map_df.sort_values(["번호","주택형"]).groupby("단지명").first().reset_index()
-    rep["label"] = rep["번호"].astype(str)
+    r1  = df[df["순위"]=="1"].groupby(["단지명","band"])["접수건수"].sum().reset_index(name="접수1")
+    r12 = df[df["순위"].isin(["1","2"])].groupby(["단지명","band"])["접수건수"].sum().reset_index(name="접수12")
+    band = band.merge(r1, on=["단지명","band"], how="left").merge(r12, on=["단지명","band"], how="left")
+    band[["접수1","접수12"]] = band[["접수1","접수12"]].fillna(0)
+    band["경쟁률(1순위)"]   = band.apply(lambda r: round(r["접수1"]/r["공급세대수"],2) if r["공급세대수"] else None, axis=1)
+    band["경쟁률(1,2순위)"] = band.apply(lambda r: round(r["접수12"]/r["공급세대수"],2) if r["공급세대수"] else None, axis=1)
 
-    if rep.empty:
-        st.info("지오코딩 결과가 없어 지도를 표시할 수 없습니다. 주소 표기를 점검하거나 KAKAO_REST_KEY를 설정하세요.")
+    meta = (df.groupby("단지명").agg(모집공고일=("모집공고일","first")).reset_index())
+    meta["모집공고월"] = meta["모집공고일"].astype(str).str.slice(0,7)
+    if cover_df is not None and "HOUSE_NM" in cover_df.columns:
+        cov = cover_df.copy()
+        cov["입주예정월"] = cov.get("MVN_PREARNGE_YM","").apply(lambda v: f"{str(v)[:4]}-{str(v)[4:]}" if (pd.notna(v) and len(str(v))==6) else "")
+        cov = cov.rename(columns={"HOUSE_NM":"단지명"})
+        meta = meta.merge(cov[["단지명","입주예정월"]].drop_duplicates("단지명"), on="단지명", how="left")
     else:
-        midpoint = [rep["lat"].mean(), rep["lon"].mean()]
-        layer_text = pdk.Layer(
-            "TextLayer",
-            data=rep,
-            get_position='[lon, lat]',
-            get_text='label',
-            get_size=16,
-            get_color='[0, 0, 0, 255]',
-        )
-        layer_scatter = pdk.Layer(
-            "ScatterplotLayer",
-            data=rep,
-            get_position='[lon, lat]',
-            get_radius=60,
-            pickable=True,
-        )
-        st.pydeck_chart(pdk.Deck(
-            map_style=None,
-            initial_view_state=pdk.ViewState(latitude=midpoint[0], longitude=midpoint[1], zoom=7),
-            layers=[layer_scatter, layer_text],
-            tooltip={"text": "{단지명}\n번호 {번호}\n{공급위치}"}
-        ))
+        meta["입주예정월"] = ""
 
-    st.subheader("📥 Excel 산출")
-    xbytes = build_excel(by_complex_df, cover_df, detail_df, combine_df)
-    st.download_button(
-        label="엑셀 다운로드 (단지별청약경쟁률 / cover / detail / combine)",
-        data=xbytes,
-        file_name=f"applyhome_{today_ymd()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    out = {}
+    for site, g in band.groupby("단지명"):
+        g = g.sort_values("band")
+        rows = g.rename(columns={"band":"타입"})[["타입","공급세대수","공급가액","평단가","경쟁률(1순위)","경쟁률(1,2순위)"]].copy()
+        # 소계(가중)
+        ts = g["공급세대수"].sum()
+        def _fmtn(v): return f"{int(round(v)):,}" if pd.notna(v) else ""
+        rows["공급세대수"] = rows["공급세대수"].map(_fmtn)
+        rows["공급가액"]   = rows["공급가액"].map(_fmtn)
+        rows["평단가"]     = rows["평단가"].map(lambda v: f"@{int(round(v)):,}" if pd.notna(v) else "")
+        out[site] = {
+            "meta": meta[meta["단지명"]==site].iloc[0].to_dict() if site in set(meta["단지명"]) else {"모집공고월":"","입주예정월":""},
+            "rows": rows,
+            "totals": {
+                "세대수": int(ts) if pd.notna(ts) else 0,
+                "공급가액": int(round((g["공급가액"]*g["공급세대수"]).sum()/ts)) if ts>0 else None,
+                "평단가": int(round((g["평단가"]*g["공급세대수"]).sum()/ts)) if ts>0 else None,
+                "경쟁률1": round(g["접수1"].sum()/ts,2) if ts>0 else None,
+                "경쟁률12": round(g["접수12"].sum()/ts,2) if ts>0 else None,
+            }
+        }
+    return out
+
+def render_card(site: str, info: dict):
+    m, rows, t = info["meta"], info["rows"], info["totals"]
+    st.markdown(
+        f"""
+        <div style="border:1px solid #666;padding:8px;margin:10px 0;border-radius:6px;">
+          <div style="display:flex;justify-content:space-between;">
+            <div style="font-weight:700;">{site}</div>
+            <div style="font-size:12px;color:#666;">(단위 : 만원)</div>
+          </div>
+          <div style="font-size:12px;margin-top:6px;">
+            <b>모집공고일:</b> {m.get('모집공고월','')} &nbsp;&nbsp;
+            <b>입주예정월:</b> {m.get('입주예정월','') or ''}
+          </div>
+        """, unsafe_allow_html=True
+    )
+    st.dataframe(rows, use_container_width=True)
+    st.markdown(
+        f"""
+        <div style="display:flex;gap:12px;font-size:13px;margin-top:6px;">
+          <div><b>소계</b></div>
+          <div>세대수: {t['세대수']:,}</div>
+          <div>공급가액: {t['공급가액']:, if t['공급가액'] is not None else ''}</div>
+          <div>평단가: @{t['평단가']:, if t['평단가'] is not None else ''}</div>
+          <div>경쟁률(1): {t['경쟁률1'] if t['경쟁률1'] is not None else ''}</div>
+          <div>경쟁률(1,2): {t['경쟁률12'] if t['경쟁률12'] is not None else ''}</div>
+        </div>
+        </div>
+        """, unsafe_allow_html=True
     )
 
+st.header("📦 GitHub Actions Artifact 불러오기 → 카드 보기")
+if st.button("최신 아티팩트 불러오기"):
+    try:
+        z = download_latest_artifact_zip(GH_OWNER, GH_REPO, ARTIFACT_NAME)
+        xbytes, xname = extract_first_excel_from_zip(z)
+        st.success(f"다운로드 완료: {xname}")
+        xf = pd.ExcelFile(io.BytesIO(xbytes))
+        detail = pd.read_excel(xf, "단지세부정보")
+        cover  = pd.read_excel(xf, "aptlist(cover)") if "aptlist(cover)" in xf.sheet_names else None
+        cards = build_cards_from_detail_sheet(detail, cover)
+        for site in sorted(cards.keys()):
+            render_card(site, cards[site])
+    except Exception as e:
+        st.error(f"불러오기 실패: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # [NEW] 엑셀(단지세부정보) → 카드 생성 탭
