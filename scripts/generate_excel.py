@@ -1,8 +1,10 @@
-from datetime import datetime, timezone, timedelta
-from app import (
-    two_weeks_range, build_cover_df, build_detail_df,
-    build_combine_df, build_by_complex_df, build_excel, ALL_AREA_CODES
-)
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))  # 리포 루트가 import 경로에 추가
+from app import (two_weeks_range, build_cover_df, build_detail_df,
+                 build_combine_df, build_by_complex_df, build_excel, ALL_AREA_CODES)
+
 
 def main():
     start, end = two_weeks_range()
