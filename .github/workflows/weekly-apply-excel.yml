@@ -4,6 +4,10 @@ on:
     - cron: '0 23 * * 0'  # 월요일 08:00 KST
   workflow_dispatch: {}
 
+# 리포에 푸시하려면 권한이 필요합니다
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,12 +29,29 @@ jobs:
         env:
           ODCLOUD_SERVICE_KEY: ${{ secrets.ODCLOUD_SERVICE_KEY }}
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}  # 안전용
         run: |
           python scripts/generate_excel.py
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: weekly-excel
-          path: applyhome_*.xlsx
+      # (선택) 생성 여부 바로 확인
+      - name: List files for debug
+        run: |
+          ls -al
+          ls -al *.xlsx || true
+
+
+      # ⬇️ 리포에 커밋/푸시 (outputs/ 폴더)
+      - name: Commit Excel to repo (outputs/)
+        # 메인 브랜치에서만 커밋하고 싶으면 다음 줄 주석 해제
+        # if: github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          mkdir -p outputs
+          mv applyhome_*.xlsx outputs/ || true
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add outputs/*.xlsx
+          git commit -m "chore(excel): weekly $(date -u +'%Y-%m-%d')" || echo "Nothing to commit"
+          git push
