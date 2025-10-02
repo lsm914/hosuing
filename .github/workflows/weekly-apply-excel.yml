@@ -25,6 +25,7 @@ jobs:
         env:
           ODCLOUD_SERVICE_KEY: ${{ secrets.ODCLOUD_SERVICE_KEY }}
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python scripts/generate_excel.py
 
